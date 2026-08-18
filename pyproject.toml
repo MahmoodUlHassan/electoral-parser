@@ -1,0 +1,30 @@
+[project]
+name = "electoral-parser"
+version = "0.1.0"
+description = "OCR pipeline for India 2026 Electoral Roll PDFs"
+requires-python = ">=3.12"
+dependencies = [
+    "pymupdf>=1.24",
+    "opencv-python-headless>=4.10",
+    "pillow>=10",
+    "numpy>=1.26",
+    "paddleocr>=3.0",
+    "paddlepaddle>=3.0",
+    "polars>=1.0",
+    "rich>=13",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Electoral roll search</title>
+  <style>
+    :root {
+      --bg: #f4f2ec;
+      --ink: #1c1b19;
+      --muted: #5c5852;
+      --line: #d9d4c8;
+      --paper: #fffcf7;
+      --accent: #1f4d3a;
+      --hit: #e8f0eb;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 15px/1.45 "IBM Plex Sans", "Source Sans 3", system-ui, sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+    }
+    header {
+      padding: 28px 32px 20px;
+      border-bottom: 1px solid var(--line);
+      background: var(--paper);
+    }
+    h1 { margin: 0 0 6px; font-size: 22px; font-weight: 600; }
+    .meta { color: var(--muted); font-size: 13px; }
+    main { padding: 24px 32px 48px; max-width: 1360px; }
+    label { display: block; font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+    input[type="search"] {
+      width: 100%;
+      max-width: 560px;
+      font: inherit;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      background: var(--paper);
+      color: var(--ink);
+      border-radius: 0;
+    }
+    input[type="search"]:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .status { margin: 14px 0 18px; color: var(--muted); font-size: 13px; }
+    table { width: 100%; border-collapse: collapse; background: var(--paper); }
+    th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; font-size: 13px; }
+    th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); font-weight: 600; }
+    tr:hover td { background: var(--hit); }
+    .name { font-weight: 600; }
+    .epic { font-variant-numeric: tabular-nums; font-family: ui-monospace, Menlo, monospace; }
+    .empty { color: var(--muted); padding: 24px 0; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Search electoral roll</h1>
+    <div class="meta" id="stats">Loading roll…</div>
+  </header>
+  <main>
+    <label for="q">Name, relative, EPIC, house, or section</label>
+    <input id="q" type="search" autocomplete="off" placeholder="e.g. Pavankumar  or  SWD7756588" autofocus />
+    <div class="status" id="status">Type at least 2 characters.</div>
+    <div id="results"></div>
+  </main>
+  <script>
+    const q = document.getElementById("q");
+    const status = document.getElementById("status");
+    const results = document.getElementById("results");
+    const stats = document.getElementById("stats");
+    let timer = null;
+
+    fetch("/api/stats").then(r => r.json()).then(s => {
+      stats.textContent = s.total + " voters loaded · " + s.csv;
+    }).catch(() => { stats.textContent = "Could not load voter CSV."; });
+
+    function esc(v) {
+      if (v === null || v === undefined) return "";
+      return String(v).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    }
+
+    async function run() {
+      const query = q.value.trim();
+      if (query.length < 2) {
+        results.innerHTML = "";
+        status.textContent = "Type at least 2 characters.";
+        return;
+      }
+      status.textContent = "Searching…";
+      const res = await fetch("/api/search?q=" + encodeURIComponent(query));
+      const data = await res.json();
+      if (!data.count) {
+        results.innerHTML = '<p class="empty">No matches.</p>';
+        status.textContent = "0 matches";
+        return;
+      }
+      const shown = data.voters.length;
+      status.textContent = data.count + " match" + (data.count === 1 ? "" : "es")
+        + (data.count > shown ? " (showing first " + shown + ")" : "");
+      const rows = data.voters.map(v => `
+        <tr>
+          <td>${esc(v.serialNo)}</td>
+          <td class="epic">${esc(v.epic)}</td>
+          <td class="name">${esc(v.name)}</td>
+          <td>${esc(v.relationType)}</td>
+          <td>${esc(v.relativeName)}</td>
+          <td>${esc(v.houseNo)}</td>
+          <td>${esc(v.age)}</td>
+          <td>${esc(v.gender)}</td>
+          <td>${esc(v.section)}</td>
+          <td>${esc(v.partNo)} / ${esc(v.sourcePdf)}</td>
+        </tr>`).join("");
+      results.innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>S.No</th><th>EPIC</th><th>Name</th><th>Relation</th><th>Relative</th>
+              <th>House</th><th>Age</th><th>Gender</th><th>Section</th><th>Part</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    }
+
+    q.addEventListener("input", () => {
+      clearTimeout(timer);
+      timer = setTimeout(run, 160);
+    });
+    q.addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
+  </script>
+</body>
+</html>

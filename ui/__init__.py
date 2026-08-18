@@ -1,0 +1,1 @@
+"""Local voter search UI."""

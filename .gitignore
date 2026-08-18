@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# Runtime artifacts
+output/
+debug/
+logs/
+csv/
+json/
+
+# Model cache
+.paddleocr/
+~/.paddleocr/
+
+.DS_Store
+*.log
+*.pdf
