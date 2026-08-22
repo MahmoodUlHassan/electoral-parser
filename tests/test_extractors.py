@@ -67,6 +67,11 @@ def test_band_parsers_and_fill_does_not_overwrite():
     assert parse_house_line("House Number : 1-37/7/1 Aao :65 Condor :Molo") == "1-37/7/1"
     assert parse_house_line("House Number : H NO 1-87/7/1 A ao : 22 Condor : Molo") == "H NO 1-87/7/1"
     assert parse_age_gender_line("Age : 61 Gender : Female") == (61, "Female")
+    assert parse_age_gender_line("Aae : 38 Cender : Mele") == (38, "Male")
+    assert parse_age_gender_line("Aao: 38. Gondor : Mele") == (38, "Male")
+    assert parse_age_gender_line("Ace:40 Cender • Femele") == (40, "Female")
+    assert parse_age_gender_line("A.ae :25Condor: Eomolo") == (25, "Female")
+    assert parse_age_gender_line("Aae : 25 Cender : Femcle") == (25, "Female")
 
     rec = parse_voter_card(
         CARD_TOKENS, page=3, meta=PageMeta(), crop_width=400, crop_height=200

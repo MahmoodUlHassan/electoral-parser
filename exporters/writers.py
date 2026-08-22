@@ -23,6 +23,22 @@ CSV_COLUMNS = [
     "section",
 ]
 
+# Explicit schema — mixed null/str section (and similar) breaks Polars infer.
+CSV_SCHEMA: dict[str, pl.DataType] = {
+    "serialNo": pl.Int64,
+    "epic": pl.Utf8,
+    "name": pl.Utf8,
+    "relationType": pl.Utf8,
+    "relativeName": pl.Utf8,
+    "houseNo": pl.Utf8,
+    "age": pl.Int64,
+    "gender": pl.Utf8,
+    "page": pl.Int64,
+    "partNo": pl.Int64,
+    "constituency": pl.Utf8,
+    "section": pl.Utf8,
+}
+
 
 def export_voters(
     voters: list[VoterRecord],
@@ -39,7 +55,7 @@ def export_voters(
 
     rows = [v.to_public_dict() for v in voters]
     if rows:
-        df = pl.from_dicts(rows).select(CSV_COLUMNS)
+        df = pl.from_dicts(rows, schema=CSV_SCHEMA).select(CSV_COLUMNS)
     else:
-        df = pl.DataFrame({col: [] for col in CSV_COLUMNS})
+        df = pl.DataFrame(schema=CSV_SCHEMA)
     df.write_csv(csv_path)

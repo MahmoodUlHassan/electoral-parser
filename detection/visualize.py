@@ -5,6 +5,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from parser.config import DEFAULT_LAYOUT, LayoutProfile, RelativeBox
 from parser.models import CardDetection
 
 
@@ -33,12 +34,59 @@ def crop_card(image_bgr: np.ndarray, card: CardDetection) -> np.ndarray:
     return image_bgr[b.y : b.y2, b.x : b.x2].copy()
 
 
-def crop_relative(image_bgr: np.ndarray, region) -> np.ndarray:
+def crop_card_padded(
+    image_bgr: np.ndarray,
+    card: CardDetection,
+    *,
+    pad_top: float = 0.10,
+    pad_bottom: float = 0.14,
+    pad_x: float = 0.02,
+) -> np.ndarray:
+    """Widen the grid cell slightly — last pages often clip serial/EPIC/Age."""
+    h, w = image_bgr.shape[:2]
+    b = card.box
+    top = max(0, b.y - int(b.h * pad_top))
+    bottom = min(h, b.y2 + int(b.h * pad_bottom))
+    left = max(0, b.x - int(b.w * pad_x))
+    right = min(w, b.x2 + int(b.w * pad_x))
+    return image_bgr[top:bottom, left:right].copy()
+
+
+def crop_relative(image_bgr: np.ndarray, region: RelativeBox) -> np.ndarray:
     h, w = image_bgr.shape[:2]
     x, y, bw, bh = region.pixel_box(w, h)
     if bw <= 0 or bh <= 0:
         return image_bgr[0:0, 0:0].copy()
     return image_bgr[y : y + bh, x : x + bw].copy()
+
+
+def _paste_region(dst: np.ndarray, src: np.ndarray, region: RelativeBox) -> None:
+    h, w = src.shape[:2]
+    x, y, bw, bh = region.pixel_box(w, h)
+    if bw <= 0 or bh <= 0:
+        return
+    dst[y : y + bh, x : x + bw] = src[y : y + bh, x : x + bw]
+
+
+def crop_card_for_ocr(
+    image_bgr: np.ndarray,
+    card: CardDetection,
+    layout: LayoutProfile = DEFAULT_LAYOUT,
+) -> np.ndarray:
+    """Full-card-sized crop with photo wiped; text_region + epic strips kept."""
+    return prepare_card_ocr_image(crop_card(image_bgr, card), layout)
+
+
+def prepare_card_ocr_image(
+    crop: np.ndarray,
+    layout: LayoutProfile = DEFAULT_LAYOUT,
+) -> np.ndarray:
+    """Wipe photo body on an already-cropped card; keep text + epic strips."""
+    out = np.full_like(crop, 255)
+    _paste_region(out, crop, layout.text_region)
+    _paste_region(out, crop, layout.epic_region)
+    _paste_region(out, crop, layout.epic_fallback_region)
+    return out
 
 
 def save_card_crop(image_bgr: np.ndarray, card: CardDetection, path: Path) -> np.ndarray:
