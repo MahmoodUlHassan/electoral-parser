@@ -48,15 +48,22 @@ class LayoutProfile:
     footer_min: float = 0.968
     # Inside a voter card (fractions of the card crop).
     serial_box: RelativeBox = RelativeBox(0.00, 0.00, 0.16, 0.28)
-    epic_region: RelativeBox = RelativeBox(0.42, 0.00, 0.32, 0.22)
+    # Short top strip into the photo gutter — tall enough for EPIC, short enough to
+    # avoid "Photo Available" which makes tiny OCR drop the last digit.
+    epic_region: RelativeBox = RelativeBox(0.50, 0.00, 0.48, 0.18)
+    # Fallback when primary strip still truncates (measured: x>0.55, y<0.28).
+    epic_fallback_region: RelativeBox = RelativeBox(0.55, 0.00, 0.44, 0.28)
     photo_region: RelativeBox = RelativeBox(0.76, 0.02, 0.24, 0.96)
-    text_region: RelativeBox = RelativeBox(0.01, 0.00, 0.75, 0.99)
+    # Body + serial column; EPIC pasted separately for OCR crops.
+    text_region: RelativeBox = RelativeBox(0.01, 0.00, 0.74, 0.99)
     # Ink bands below this y-fraction are body lines (Name…Age), not serial/EPIC.
     body_line_min_y: float = 0.18
     # Fallback only if projection finds too few lines (4-line layout).
     house_region: RelativeBox = RelativeBox(0.01, 0.415, 0.74, 0.125)
     age_region: RelativeBox = RelativeBox(0.01, 0.530, 0.74, 0.145)
     age_fallback_region: RelativeBox = RelativeBox(0.01, 0.640, 0.74, 0.16)
+    # 6-line wraps push Age to the bottom edge (or just below fixed age bands).
+    age_crowded_region: RelativeBox = RelativeBox(0.01, 0.780, 0.74, 0.20)
     occupancy_ink_ratio: float = 0.03
     epic_pattern: str = r"^[A-Z]{3}[0-9]{7}$"
     age_min: int = 18

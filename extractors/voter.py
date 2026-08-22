@@ -5,8 +5,16 @@ import re
 from parser.models import OcrToken, PageMeta, VoterRecord
 
 _EPIC_RE = re.compile(r"[A-Z]{3}[0-9]{7}")
-_AGE_RE = re.compile(r"Age\s*[:\-]\s*(\d{1,3})", re.I)
-_GENDER_RE = re.compile(r"Gender\s*[:\-]\s*(Male|Female|Others?|Third\s*Gender)", re.I)
+# Tiny OCR often mangles Age/Gender on noisy last pages (Aae/Ace/Cender/Mele…).
+_AGE_RE = re.compile(
+    r"(?:Age|Aae|Aao|Ace|Aqe|A\.?\s*ae|A\s*ge)\s*[:\-·•.]?\s*([0-9OoIl]{1,3})",
+    re.I,
+)
+_GENDER_RE = re.compile(
+    r"(?:Gender|Cender|Condor|Gondor|Gend[eo]r|Ccnder)\s*[:\-·•.]?\s*"
+    r"(Male|Female|Mele|Femele|Femcle|Femole|Eomolo|Molo|Femaie|Others?|Third\s*Gender)",
+    re.I,
+)
 _HOUSE_RE = re.compile(r"Hou[a-z]{0,3}\s*Num[a-z]{0,4}\s*[:\-]?\s*(.+)$", re.I)
 _HNO_RE = re.compile(r"H\.?\s*No\.?\s*[:\-]?\s*(.+)$", re.I)
 _HOUSE_LABEL_RE = re.compile(r"^(?:Hou[a-z]{0,3}\s*Num[a-z]{0,4}|H\.?\s*No\.?)\s*[:\-]?$", re.I)
@@ -81,6 +89,10 @@ def _normalize_epic(text: str) -> str | None:
     return None
 
 
+def normalize_epic(text: str) -> str | None:
+    """Public wrapper used by epic-strip refill."""
+    return _normalize_epic(text)
+
 def parse_house_line(text: str) -> str | None:
     blob = _clean_value(re.sub(r"\s+", " ", text or ""))
     if not blob or _HOUSE_LABEL_RE.match(blob):
@@ -102,13 +114,31 @@ def parse_house_line(text: str) -> str | None:
     return None
 
 
+def _normalize_age_digits(raw: str) -> int | None:
+    digits = (
+        raw.upper()
+        .replace("O", "0")
+        .replace("Ó", "0")
+        .replace("Ò", "0")
+        .replace("I", "1")
+        .replace("L", "1")
+    )
+    digits = re.sub(r"\D", "", digits)
+    if not digits:
+        return None
+    try:
+        return int(digits)
+    except ValueError:
+        return None
+
+
 def parse_age_gender_line(text: str) -> tuple[int | None, str | None]:
     blob = re.sub(r"\s+", " ", text or "")
     age: int | None = None
     gender: str | None = None
     m = _AGE_RE.search(blob)
     if m:
-        age = int(m.group(1))
+        age = _normalize_age_digits(m.group(1))
     m = _GENDER_RE.search(blob)
     if m:
         gender = _normalize_gender(m.group(1))
@@ -258,8 +288,14 @@ def apply_missing_band_text(
     *,
     house_text: str | None = None,
     age_text: str | None = None,
+    epic_text: str | None = None,
 ) -> VoterRecord:
     extra: list[str] = []
+    if record.epic is None and epic_text:
+        extra.append(epic_text)
+        found = _normalize_epic(epic_text)
+        if found:
+            record.epic = found
     if record.house_no is None and house_text:
         extra.append(house_text)
         parsed = parse_house_line(house_text)
@@ -278,11 +314,17 @@ def apply_missing_band_text(
 
 
 def _normalize_gender(raw: str) -> str:
-    value = raw.strip().lower()
-    if value.startswith("male"):
-        return "Male"
-    if value.startswith("female"):
+    value = re.sub(r"[^a-z]", "", raw.strip().lower())
+    if value.startswith("female") or value in {
+        "femele",
+        "femcle",
+        "femole",
+        "eomolo",
+        "femaie",
+    }:
         return "Female"
+    if value.startswith("male") or value in {"mele", "molo"}:
+        return "Male"
     return "Others"
 
 

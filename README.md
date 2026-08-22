@@ -2,7 +2,7 @@
 
 OCR pipeline for India’s **2026 English SIR draft electoral rolls** (Telangana S29). Image-only PDFs → structured JSON/CSV, then CLI or local search UI.
 
-Layout: **3×10 voter cards** per page (`eci-2026-en-3x10`). Grid-first detection; OpenCV contours as fallback. PaddleOCR English (PP-OCRv6). Wrapped Name / Father / Husband lines (4, 5, or 6 body lines) are continuation-parsed; missing House/Age/Relation get a second-pass OCR on detected ink bands.
+Layout: **3×10 voter cards** per page (`eci-2026-en-3x10`). Grid-first detection; OpenCV contours as fallback. PaddleOCR English defaults to **PP-OCRv6_tiny**; invalid cards are re-OCR’d with **small** at end of each PDF (`--retry-small`). Use `--ocr-model small` to run small for everything. Wrapped Name / Father / Husband lines (4, 5, or 6 body lines) are continuation-parsed; missing House/Age/Relation get a second-pass OCR on detected ink bands, and **6-line wraps force fixed Age strips** (including a bottom crowded band). Sparse/last voter pages OCR a **padded full-card crop** (no photo wipe) so clipped serial/EPIC/Age survive; small-retry reuses kept page rasters when available.
 
 Companion downloader: [electoral-downloader](https://github.com/MahmoodUlHassan/electoral-downloader).
 
@@ -35,9 +35,11 @@ python main.py --help
 python main.py parse --help
 ```
 
-PDFs are image JPEGs (~1983×2806). Native extract is the default (sharper than upsampling). Card crops are OCR’d at **2×**.
+PDFs are image JPEGs (~1983×2806). Native extract is the default (sharper than upsampling). Card OCR uses the **text + EPIC strip only** (photo wiped) at **2×**. Band refill runs only when first-pass fields are incomplete.
 
 Point `--pdf` at a **file** or an **AC folder** of `part_*.pdf` (natural-sorted). Folder mode skips parts that already have `voters.csv` and appends to `output/csv/all_voters.csv`.
+
+After a successful parse (≥90% of expected/extracted valid), **`--delete-pdf`** (default) removes the source PDF; **valid** card crops are deleted; **invalid** crops are kept; page rasters/overlays are kept only for pages that still have invalid cards (e.g. `debug/part_217/pages/page37.png`). Use **`--keep-pdf`** to retain the PDF. **`--workers 2`** (or 3) parses multiple PDFs in parallel (each process loads its own Paddle).
 
 ### Mini run — one voter page
 
@@ -78,6 +80,8 @@ Optional debug overlays (keep off for batches):
 python main.py parse path/to/part_1.pdf --pages 3 --visualize -v
 ```
 
+Use `--profile` to print a phase timing table and write `logs/profile_<stem>.json`. Card OCR defaults to **`--ocr-workers 1`**. Primary model is **`--ocr-model tiny`**; after each PDF, invalid cards are re-read with **small** unless `--no-retry-small`. Header/footer OCR runs once per part, then reuses metadata.
+
 Page subsets:
 
 ```bash
@@ -91,6 +95,20 @@ Resume-safe: existing `output/part_N/csv/voters.csv` is skipped.
 ```bash
 python main.py parse \
   ../electoral-downloader/downloads/Rangareddy/52_Serilingampally
+```
+
+Faster batch (2–3 workers; each needs RAM for Paddle):
+
+```bash
+python main.py parse \
+  ../electoral-downloader/downloads/Rangareddy/52_Serilingampally \
+  --workers 2
+```
+
+Keep PDFs after parse:
+
+```bash
+python main.py parse path/to/folder --keep-pdf
 ```
 
 ## Search and UI
