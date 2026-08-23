@@ -13,6 +13,13 @@
       --paper: #fffcf7;
       --accent: #1f4d3a;
       --hit: #e8f0eb;
+      --scanned: #1f4d3a;
+      --scanned-soft: #cfe0d6;
+      --pending: #c8c3b8;
+      --pending-soft: #e7e3da;
+      --warn: #8a3b12;
+      --warn-soft: #f0d9c8;
+      --selected: #c45c26;
     }
     * { box-sizing: border-box; }
     body {
@@ -20,6 +27,7 @@
       font: 15px/1.45 "IBM Plex Sans", "Source Sans 3", system-ui, sans-serif;
       color: var(--ink);
       background: var(--bg);
+      min-height: 100vh;
     }
     header {
       padding: 28px 32px 20px;
@@ -28,7 +36,17 @@
     }
     h1 { margin: 0 0 6px; font-size: 22px; font-weight: 600; }
     .meta { color: var(--muted); font-size: 13px; }
-    main { padding: 24px 32px 48px; max-width: 1360px; }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
+      gap: 0;
+      min-height: calc(100vh - 90px);
+    }
+    .search-pane {
+      padding: 24px 32px 48px;
+      border-right: 1px solid var(--line);
+      min-width: 0;
+    }
     label { display: block; font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
     input[type="search"] {
       width: 100%;
@@ -42,6 +60,29 @@
     }
     input[type="search"]:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
     .status { margin: 14px 0 18px; color: var(--muted); font-size: 13px; }
+    .filter-chip {
+      display: none;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 0 0 12px;
+      padding: 8px 10px;
+      background: var(--hit);
+      border: 1px solid #9bb5a6;
+      font-size: 13px;
+      max-width: 560px;
+    }
+    .filter-chip.visible { display: flex; }
+    .filter-chip button {
+      border: 0;
+      background: transparent;
+      color: var(--accent);
+      font: inherit;
+      cursor: pointer;
+      text-decoration: underline;
+      text-underline-offset: 2px;
+      padding: 0;
+    }
     table { width: 100%; border-collapse: collapse; background: var(--paper); }
     th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; font-size: 13px; }
     th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); font-weight: 600; }
@@ -49,6 +90,153 @@
     .name { font-weight: 600; }
     .epic { font-variant-numeric: tabular-nums; font-family: ui-monospace, Menlo, monospace; }
     .empty { color: var(--muted); padding: 24px 0; }
+
+    .coverage {
+      background: var(--paper);
+      padding: 20px 18px 28px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      max-height: calc(100vh - 90px);
+      overflow: auto;
+    }
+    .coverage h2 {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .cov-summary { font-size: 13px; color: var(--ink); }
+    .cov-summary strong { font-variant-numeric: tabular-nums; }
+    .crumb {
+      display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+      font-size: 12px; color: var(--muted);
+    }
+    .crumb button {
+      border: 0; background: transparent; color: var(--accent);
+      font: inherit; cursor: pointer; padding: 0; text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+    .crumb .here { color: var(--ink); font-weight: 600; text-decoration: none; cursor: default; }
+    .crumb .clear-filter {
+      margin-left: 4px;
+      color: var(--muted);
+    }
+    .legend { display: flex; gap: 12px; font-size: 11px; color: var(--muted); flex-wrap: wrap; }
+    .legend span::before {
+      content: ""; display: inline-block; width: 10px; height: 10px;
+      margin-right: 5px; vertical-align: -1px;
+    }
+    .legend .lg-on::before { background: var(--scanned); }
+    .legend .lg-off::before { background: var(--pending); }
+    .legend .lg-bad::before { background: var(--warn); }
+
+    .cal-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+      gap: 6px;
+    }
+    .cal-cell {
+      border: 1px solid var(--line);
+      background: var(--pending-soft);
+      color: var(--ink);
+      padding: 10px 8px;
+      text-align: left;
+      cursor: pointer;
+      font: inherit;
+      min-height: 64px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 6px;
+    }
+    .cal-cell:hover { outline: 2px solid var(--accent); outline-offset: 0; }
+    .cal-cell.selected {
+      outline: 2px solid var(--selected);
+      outline-offset: 0;
+      box-shadow: inset 0 0 0 1px var(--selected);
+    }
+    .cal-cell .title { font-size: 12px; font-weight: 600; line-height: 1.25; }
+    .cal-cell .sub { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .cal-cell.done {
+      background: var(--scanned-soft);
+      border-color: #9bb5a6;
+    }
+    .cal-cell.done .sub { color: var(--accent); }
+
+    .part-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(44px, 1fr));
+      gap: 4px;
+    }
+    .part-item {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+    .part-cell {
+      border: 1px solid transparent;
+      padding: 4px 2px;
+      min-height: 40px;
+      background: var(--pending);
+      color: #3a3834;
+      cursor: pointer;
+      font: inherit;
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1px;
+      line-height: 1.1;
+    }
+    .part-cell .pn { font-weight: 600; }
+    .part-cell .inv {
+      font-size: 9px;
+      color: var(--warn);
+      font-weight: 600;
+    }
+    .part-cell.on {
+      background: var(--scanned);
+      color: #f5faf7;
+    }
+    .part-cell.on .inv { color: #f0d9c8; }
+    .part-cell.has-bad {
+      background: var(--warn-soft);
+      border-color: #d4a078;
+      color: var(--ink);
+    }
+    .part-cell.has-bad.on {
+      background: #6b3a1f;
+      color: #fff8f3;
+      border-color: #6b3a1f;
+    }
+    .part-cell.selected {
+      outline: 2px solid var(--selected);
+      outline-offset: 0;
+      z-index: 1;
+      position: relative;
+    }
+    .part-cell:hover { outline: 1px solid var(--ink); outline-offset: 0; z-index: 1; position: relative; }
+    .part-pdf {
+      font-size: 9px;
+      text-align: center;
+      color: var(--accent);
+      text-decoration: none;
+      letter-spacing: 0.02em;
+    }
+    .part-pdf:hover { text-decoration: underline; }
+    .part-hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+      .search-pane { border-right: 0; border-bottom: 1px solid var(--line); }
+      .coverage { max-height: none; }
+    }
   </style>
 </head>
 <body>
@@ -56,18 +244,43 @@
     <h1>Search electoral roll</h1>
     <div class="meta" id="stats">Loading roll…</div>
   </header>
-  <main>
-    <label for="q">Name, relative, EPIC, house, or section</label>
-    <input id="q" type="search" autocomplete="off" placeholder="e.g. Pavankumar  or  SWD7756588" autofocus />
-    <div class="status" id="status">Type at least 2 characters.</div>
-    <div id="results"></div>
-  </main>
+  <div class="layout">
+    <section class="search-pane">
+      <label for="q">Name, relative, EPIC, house, or section</label>
+      <input id="q" type="search" autocomplete="off" placeholder="e.g. Pavankumar  or  SWD7756588" autofocus />
+      <div class="filter-chip" id="filterChip"></div>
+      <div class="status" id="status">Type at least 2 characters, or pick a coverage filter.</div>
+      <div id="results"></div>
+    </section>
+    <aside class="coverage" id="coverage" aria-label="Scan coverage">
+      <h2>Coverage</h2>
+      <div class="cov-summary" id="covSummary">Loading…</div>
+      <div class="legend">
+        <span class="lg-on">Scanned</span>
+        <span class="lg-off">Pending</span>
+        <span class="lg-bad">Has invalid</span>
+      </div>
+      <div class="crumb" id="covCrumb"></div>
+      <div id="covView"></div>
+    </aside>
+  </div>
   <script>
     const q = document.getElementById("q");
     const status = document.getElementById("status");
     const results = document.getElementById("results");
     const stats = document.getElementById("stats");
+    const filterChip = document.getElementById("filterChip");
     let timer = null;
+
+    /** @type {{ district: string|null, folder: string|null, acName: string|null, acFolder: string|null, asmblyNo: number|null, partNo: number|null }} */
+    let covFilter = {
+      district: null,
+      folder: null,
+      acName: null,
+      acFolder: null,
+      asmblyNo: null,
+      partNo: null,
+    };
 
     fetch("/api/stats").then(r => r.json()).then(s => {
       stats.textContent = s.total + " voters loaded · " + s.csv;
@@ -78,15 +291,109 @@
       return String(v).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
     }
 
-    async function run() {
-      const query = q.value.trim();
-      if (query.length < 2) {
-        results.innerHTML = "";
-        status.textContent = "Type at least 2 characters.";
+    function hasCoverageFilter() {
+      return !!(covFilter.folder || covFilter.district || covFilter.acFolder || covFilter.asmblyNo || covFilter.partNo);
+    }
+
+    function acFolderFrom(asmblyNo, name) {
+      return String(asmblyNo) + "_" + String(name || "").replace(/ /g, "_");
+    }
+
+    function filterLabel() {
+      if (!hasCoverageFilter()) return "";
+      const bits = [];
+      bits.push(covFilter.district || covFilter.folder || "?");
+      if (covFilter.acFolder || covFilter.asmblyNo) {
+        bits.push(covFilter.acFolder || (covFilter.asmblyNo + " " + (covFilter.acName || "")));
+      }
+      if (covFilter.partNo != null) bits.push("part " + covFilter.partNo);
+      return bits.join(" / ");
+    }
+
+    function renderFilterChip() {
+      if (!hasCoverageFilter()) {
+        filterChip.classList.remove("visible");
+        filterChip.innerHTML = "";
         return;
       }
-      status.textContent = "Searching…";
-      const res = await fetch("/api/search?q=" + encodeURIComponent(query));
+      filterChip.classList.add("visible");
+      filterChip.innerHTML =
+        `<span>Filtering: ${esc(filterLabel())}</span>`
+        + `<button type="button" id="clearFilterBtn">Clear ✕</button>`;
+      document.getElementById("clearFilterBtn").addEventListener("click", () => {
+        clearCoverageFilter({ keepView: true });
+        run();
+        renderCoverage();
+      });
+    }
+
+    function clearCoverageFilter(opts) {
+      covFilter = {
+        district: null,
+        folder: null,
+        acName: null,
+        acFolder: null,
+        asmblyNo: null,
+        partNo: null,
+      };
+      if (!opts || !opts.keepView) {
+        view = { level: "districts" };
+      }
+      renderFilterChip();
+    }
+
+    function setFilter(partial) {
+      covFilter = Object.assign({}, covFilter, partial);
+      renderFilterChip();
+    }
+
+    function buildSearchUrl() {
+      const params = new URLSearchParams();
+      const query = q.value.trim();
+      if (query) params.set("q", query);
+      if (covFilter.folder || covFilter.district) {
+        params.set("district", covFilter.folder || covFilter.district);
+      }
+      if (covFilter.acFolder) params.set("ac", covFilter.acFolder);
+      else if (covFilter.asmblyNo != null) params.set("asmblyNo", String(covFilter.asmblyNo));
+      if (covFilter.partNo != null) params.set("part", String(covFilter.partNo));
+      return "/api/search?" + params.toString();
+    }
+
+    /** District/AC/partno for Part column, e.g. Rangareddy/52_Serilingampally/3 */
+    function formatPartPath(v) {
+      const sp = String(v.sourcePdf || "").replace(/\.pdf$/i, "");
+      if (sp.includes("/")) {
+        const bits = sp.split("/");
+        bits[bits.length - 1] = bits[bits.length - 1].replace(/^part_/i, "");
+        return bits.join("/");
+      }
+      const partNo = v.partNo != null && v.partNo !== ""
+        ? String(v.partNo)
+        : sp.replace(/^part_/i, "");
+      if (covFilter.folder || covFilter.district || covFilter.acFolder) {
+        const bits = [];
+        if (covFilter.folder || covFilter.district) {
+          bits.push(covFilter.folder || covFilter.district);
+        }
+        if (covFilter.acFolder) bits.push(covFilter.acFolder);
+        bits.push(partNo);
+        return bits.join("/");
+      }
+      if (v.constituency) return String(v.constituency) + "/" + partNo;
+      return partNo;
+    }
+
+    async function run() {
+      const query = q.value.trim();
+      const filtered = hasCoverageFilter();
+      if (query.length < 2 && !filtered) {
+        results.innerHTML = "";
+        status.textContent = "Type at least 2 characters, or pick a coverage filter.";
+        return;
+      }
+      status.textContent = filtered && !query ? "Loading filtered voters…" : "Searching…";
+      const res = await fetch(buildSearchUrl());
       const data = await res.json();
       if (!data.count) {
         results.innerHTML = '<p class="empty">No matches.</p>';
@@ -107,7 +414,7 @@
           <td>${esc(v.age)}</td>
           <td>${esc(v.gender)}</td>
           <td>${esc(v.section)}</td>
-          <td>${esc(v.partNo)} / ${esc(v.sourcePdf)}</td>
+          <td>${esc(formatPartPath(v))}</td>
         </tr>`).join("");
       results.innerHTML = `
         <table>
@@ -126,6 +433,217 @@
       timer = setTimeout(run, 160);
     });
     q.addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
+
+    /* —— coverage calendar (districts → ACs → parts) —— */
+    const covSummary = document.getElementById("covSummary");
+    const covCrumb = document.getElementById("covCrumb");
+    const covView = document.getElementById("covView");
+    let covTree = null;
+    let view = { level: "districts" }; // districts | acs | parts
+
+    function pct(scanned, total) {
+      if (!total) return "0%";
+      return Math.round((100 * scanned) / total) + "%";
+    }
+
+    function setCrumb() {
+      const bits = [];
+      bits.push(`<button type="button" data-nav="root">Telangana</button>`);
+      if (view.level === "acs" || view.level === "parts") {
+        bits.push(`<span>/</span>`);
+        const label = view.district;
+        if (view.level === "parts") {
+          bits.push(`<button type="button" data-nav="district">${esc(label)}</button>`);
+        } else {
+          bits.push(`<span class="here">${esc(label)}</span>`);
+        }
+      }
+      if (view.level === "parts") {
+        bits.push(`<span>/</span>`);
+        bits.push(`<span class="here">${esc(view.asmblyNo)} ${esc(view.acName || "")}</span>`);
+      }
+      if (hasCoverageFilter()) {
+        bits.push(`<button type="button" class="clear-filter" data-nav="clear">Clear filter</button>`);
+      }
+      covCrumb.innerHTML = bits.join(" ");
+      covCrumb.querySelectorAll("button[data-nav]").forEach(btn => {
+        btn.addEventListener("click", () => {
+          if (btn.dataset.nav === "root") {
+            view = { level: "districts" };
+            clearCoverageFilter({ keepView: true });
+            renderCoverage();
+            run();
+          } else if (btn.dataset.nav === "district") {
+            view = { level: "acs", district: view.district, folder: view.folder };
+            setFilter({
+              district: view.district,
+              folder: view.folder,
+              acName: null,
+              acFolder: null,
+              asmblyNo: null,
+              partNo: null,
+            });
+            renderCoverage();
+            run();
+          } else if (btn.dataset.nav === "clear") {
+            clearCoverageFilter({ keepView: true });
+            renderCoverage();
+            run();
+          }
+        });
+      });
+    }
+
+    function renderDistricts() {
+      const cells = covTree.districts.map(d => {
+        const selected = covFilter.folder === d.folder || covFilter.district === d.name;
+        const cls = (d.scanned > 0 ? "cal-cell done" : "cal-cell")
+          + (selected && !covFilter.asmblyNo && covFilter.partNo == null ? " selected" : "");
+        return `<button type="button" class="${cls}" data-district="${esc(d.name)}" data-folder="${esc(d.folder)}">
+          <span class="title">${esc(d.name)}</span>
+          <span class="sub">${d.scanned}/${d.total} · ${pct(d.scanned, d.total)}</span>
+        </button>`;
+      }).join("");
+      covView.innerHTML = `<div class="cal-grid">${cells}</div>`;
+      covView.querySelectorAll("[data-district]").forEach(btn => {
+        btn.addEventListener("click", () => {
+          view = { level: "acs", district: btn.dataset.district, folder: btn.dataset.folder };
+          setFilter({
+            district: btn.dataset.district,
+            folder: btn.dataset.folder,
+            acName: null,
+            acFolder: null,
+            asmblyNo: null,
+            partNo: null,
+          });
+          renderCoverage();
+          run();
+        });
+      });
+    }
+
+    function renderAcs() {
+      const dist = covTree.districts.find(d => d.name === view.district || d.folder === view.folder);
+      if (!dist) {
+        covView.innerHTML = `<p class="empty">District not found.</p>`;
+        return;
+      }
+      const cells = dist.assemblies.map(a => {
+        const selected = covFilter.asmblyNo === a.asmblyNo
+          && (covFilter.folder === view.folder || covFilter.district === view.district)
+          && covFilter.partNo == null;
+        const cls = (a.scanned > 0 ? "cal-cell done" : "cal-cell")
+          + (selected ? " selected" : "");
+        return `<button type="button" class="${cls}" data-ac="${a.asmblyNo}" data-name="${esc(a.name)}">
+          <span class="title">${a.asmblyNo}. ${esc(a.name)}</span>
+          <span class="sub">${a.scanned}/${a.total} · ${pct(a.scanned, a.total)}</span>
+        </button>`;
+      }).join("");
+      covView.innerHTML = `<div class="cal-grid">${cells}</div>`;
+      covView.querySelectorAll("[data-ac]").forEach(btn => {
+        btn.addEventListener("click", () => {
+          const asmblyNo = Number(btn.dataset.ac);
+          const acName = btn.dataset.name;
+          view = {
+            level: "parts",
+            district: view.district,
+            folder: view.folder,
+            asmblyNo,
+            acName,
+            acFolder: acFolderFrom(asmblyNo, acName),
+          };
+          setFilter({
+            district: view.district,
+            folder: view.folder,
+            acName,
+            acFolder: view.acFolder,
+            asmblyNo,
+            partNo: null,
+          });
+          renderCoverage();
+          run();
+        });
+      });
+    }
+
+    async function renderParts() {
+      covView.innerHTML = `<p class="empty">Loading parts…</p>`;
+      const url = "/api/coverage/ac?district=" + encodeURIComponent(view.district)
+        + "&asmblyNo=" + encodeURIComponent(view.asmblyNo);
+      const res = await fetch(url);
+      const data = await res.json();
+      if (data.error) {
+        covView.innerHTML = `<p class="empty">${esc(data.error)}</p>`;
+        return;
+      }
+      view.acName = data.name || view.acName;
+      view.acFolder = data.acFolder || view.acFolder || acFolderFrom(view.asmblyNo, view.acName);
+      view.folder = data.districtFolder || view.folder;
+      const cells = data.cells.map(c => {
+        const bad = (c.invalidCount || 0) > 0;
+        const selected = covFilter.partNo === c.partNo
+          && covFilter.asmblyNo === view.asmblyNo;
+        let cls = c.scanned ? "part-cell on" : "part-cell";
+        if (bad) cls += " has-bad";
+        if (selected) cls += " selected";
+        const inv = bad ? `<span class="inv">${c.invalidCount}</span>` : "";
+        const pdf = c.hasPdf && c.pdfUrl
+          ? `<a class="part-pdf" href="${esc(c.pdfUrl)}" target="_blank" rel="noopener" title="Open part ${c.partNo} PDF">PDF</a>`
+          : `<span class="part-pdf" style="visibility:hidden">PDF</span>`;
+        const title = `Part ${c.partNo}`
+          + (c.scanned ? " · scanned" : " · pending")
+          + (bad ? ` · ${c.invalidCount} invalid` : "");
+        return `<div class="part-item">
+          <button type="button" class="${cls}" data-part="${c.partNo}" title="${esc(title)}">
+            <span class="pn">${c.partNo}</span>${inv}
+          </button>
+          ${pdf}
+        </div>`;
+      }).join("");
+      covView.innerHTML = `
+        <div class="part-hint">${data.scanned}/${data.total} parts scanned · click part to filter · PDF opens roll</div>
+        <div class="part-grid">${cells}</div>`;
+      covView.querySelectorAll("button[data-part]").forEach(btn => {
+        btn.addEventListener("click", () => {
+          const partNo = Number(btn.dataset.part);
+          setFilter({
+            district: view.district,
+            folder: view.folder,
+            acName: view.acName,
+            acFolder: view.acFolder,
+            asmblyNo: view.asmblyNo,
+            partNo,
+          });
+          renderCoverage();
+          run();
+        });
+      });
+      setCrumb();
+    }
+
+    function renderCoverage() {
+      if (!covTree) return;
+      const s = covTree.summary;
+      covSummary.innerHTML = `<strong>${s.scannedParts}</strong> / ${s.totalParts} parts · `
+        + `${s.districts} districts · ${s.assemblies} ACs`
+        + (covTree.updatedAt ? ` · ledger ${esc(covTree.updatedAt)}` : "");
+      setCrumb();
+      if (view.level === "districts") renderDistricts();
+      else if (view.level === "acs") renderAcs();
+      else renderParts();
+    }
+
+    fetch("/api/coverage").then(r => r.json()).then(data => {
+      if (data.error) {
+        covSummary.textContent = data.error;
+        return;
+      }
+      covTree = data;
+      renderCoverage();
+    }).catch(err => {
+      covSummary.textContent = "Coverage unavailable.";
+      console.error(err);
+    });
   </script>
 </body>
 </html>

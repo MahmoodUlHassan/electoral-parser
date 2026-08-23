@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import multiprocessing as mp
 import re
 import shutil
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -14,14 +16,143 @@ from rich.console import Console
 from rich.table import Table
 
 from parser.logutil import setup_logging
+from parser.coverage import backfill_from_output, mark_scanned, roll_rel_path
 from parser.pipeline import RunPaths, refill_saved_json, retry_invalid_pages, run_pipeline
+from parser.raster_retry import retry_invalid_from_rasters
 from parser.search import SEARCH_COLUMNS, load_voters, search_voters
+from parser.smoke_compare import compare_page, format_stats, scan_pdf_page_assign
 
 console = Console()
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
 _PART_NUM = re.compile(r"part[_\-]?(\d+)", re.I)
 logger = logging.getLogger("electoral.cli")
+
+# Keep numeric columns stable across parts so concat/append never fights inference.
+_CSV_OVERRIDES: dict[str, pl.DataType] = {
+    "serialNo": pl.Int64,
+    "age": pl.Int64,
+    "page": pl.Int64,
+    "partNo": pl.Int64,
+}
+
+def run_paths_for_pdf(pdf: Path, out_dir: Path, debug_dir: Path, log_dir: Path) -> RunPaths:
+    """Nest under district/AC/part_N when the PDF lives in the downloads layout."""
+    rel = roll_rel_path(pdf)
+    return RunPaths(
+        json_dir=out_dir / rel / "json",
+        csv_dir=out_dir / rel / "csv",
+        debug_dir=debug_dir / rel,
+        logs_dir=log_dir,
+    )
+
+
+
+def _part_dirs_with_voters(root: Path) -> list[Path]:
+    """part_* dirs (or a single part root) that already have voters.json."""
+    root = root.expanduser().resolve()
+    if (root / "json" / "voters.json").is_file():
+        return [root]
+    return sorted(
+        p for p in root.glob("part_*") if (p / "json" / "voters.json").is_file()
+    )
+
+
+def _ac_rel_from_path(path: Path) -> Path | None:
+    """District/AC relative path from a downloads or output AC/part path."""
+    path = path.expanduser().resolve()
+    probe = path if path.is_file() else path / "part_1.pdf"
+    rel = roll_rel_path(probe)
+    if len(rel.parts) >= 2 and rel.name.startswith("part_"):
+        return rel.parent
+    return None
+
+
+def _resolve_raster_part_dirs(target: Path, out_dir: Path) -> list[Path]:
+    """Locate parsed part dirs for raster retry when PDFs are gone.
+
+    Accepts:
+    - output/.../AC or output/.../AC/part_N
+    - downloads/.../AC (empty of PDFs) → maps to out_dir/District/AC
+    """
+    target = target.expanduser().resolve()
+    out_dir = out_dir.expanduser().resolve()
+    parts = _part_dirs_with_voters(target)
+    if parts:
+        return parts
+    ac_rel = _ac_rel_from_path(target)
+    if ac_rel is not None:
+        return _part_dirs_with_voters(out_dir / ac_rel)
+    return []
+
+
+def _run_raster_retry_parts(
+    part_dirs: list[Path],
+    *,
+    out_dir: Path,
+    debug_dir: Path,
+    log_dir: Path,
+    combined: Path,
+    logger_,
+    ocr_workers: int,
+    ocr_model: str,
+    ocr_mode: str,
+    retry_small: bool,
+    skip_age_gender_clip: bool,
+) -> tuple[int, int]:
+    """Shared body for raster-based invalid retry. Returns (parts_touched, valid_delta)."""
+    out_dir = out_dir.expanduser().resolve()
+    debug_dir = debug_dir.expanduser().resolve()
+    total_delta = 0
+    parts_touched = 0
+    for part_dir in part_dirs:
+        try:
+            rel = part_dir.relative_to(out_dir)
+        except ValueError:
+            rel = Path(*part_dir.parts[-3:]) if len(part_dir.parts) >= 3 else Path(part_dir.name)
+        paths = RunPaths(
+            json_dir=out_dir / rel / "json",
+            csv_dir=out_dir / rel / "csv",
+            debug_dir=debug_dir / rel,
+            logs_dir=log_dir,
+        )
+        stats: dict = {}
+        try:
+            retry_invalid_from_rasters(
+                paths,
+                stats=stats,
+                ocr_workers=ocr_workers,
+                ocr_model=ocr_model,
+                retry_small=retry_small,
+                ocr_mode=ocr_mode,
+                skip_age_gender_clip=skip_age_gender_clip,
+            )
+        except Exception as exc:
+            logger_.exception("raster-retry failed %s: %s", part_dir.name, exc)
+            console.print(f"[red]{part_dir.name}: {exc}[/red]")
+            continue
+        pages = stats.get("retriedPages") or []
+        if not pages:
+            continue
+        parts_touched += 1
+        delta = int(stats.get("validDelta") or 0)
+        total_delta += delta
+        logger_.info(
+            "raster-retry %s pages=%s valid %s→%s (Δ%+d) clip_skipped=%s",
+            part_dir.name,
+            pages,
+            stats.get("validBefore"),
+            stats.get("validAfter"),
+            delta,
+            stats.get("clipSkippedInvalids"),
+        )
+        console.print(
+            f"[bold]{part_dir.name}[/bold] pages={pages} "
+            f"valid {stats.get('validBefore')}→{stats.get('validAfter')} "
+            f"(Δ{delta:+d}) clip_skipped={stats.get('clipSkippedInvalids')}"
+        )
+        _append_combined(paths.csv_dir / "voters.csv", f"{rel}.pdf", combined)
+    return parts_touched, total_delta
 
 
 def _sort_pdfs(pdfs: list[Path]) -> list[Path]:
@@ -32,21 +163,74 @@ def _sort_pdfs(pdfs: list[Path]) -> list[Path]:
     return sorted(pdfs, key=key)
 
 
+def _read_voters_csv(path: Path) -> pl.DataFrame:
+    """Read a voters CSV with stable dtypes (avoids Polars infer fighting across parts)."""
+    return pl.read_csv(
+        path,
+        infer_schema_length=10_000,
+        schema_overrides=_CSV_OVERRIDES,
+        ignore_errors=True,
+        truncate_ragged_lines=True,
+    )
+
+
+def _combined_sources_path(combined: Path) -> Path:
+    return combined.with_suffix(combined.suffix + ".sources")
+
+
+def _combined_source_name(pdf: Path) -> str:
+    """Stable unique key for all_voters.csv (district/AC/part_N.pdf)."""
+    return f"{roll_rel_path(pdf).as_posix()}.pdf"
+
+
 def _append_combined(csv_path: Path, source_name: str, combined: Path) -> None:
+    """Append one part's voters.csv into the combined ledger.
+
+    Uses an exclusive lock + row append (not full rewrite) so parallel parses and
+    large ledgers cannot corrupt all_voters.csv with partial overwrites/null bytes.
+    A sidecar `.sources` list prevents duplicate appends on parse resume/skip.
+    """
     if not csv_path.exists():
         return
-    df = pl.read_csv(csv_path)
+    df = _read_voters_csv(csv_path)
     if df.is_empty():
         return
     df = df.with_columns(pl.lit(source_name).alias("sourcePdf"))
-    if combined.exists():
-        prev = pl.read_csv(combined)
-        # Drop older rows from this same PDF on re-run.
-        if "sourcePdf" in prev.columns:
-            prev = prev.filter(pl.col("sourcePdf") != source_name)
-        df = pl.concat([prev, df], how="diagonal_relaxed")
+
     combined.parent.mkdir(parents=True, exist_ok=True)
-    df.write_csv(combined)
+    lock_path = combined.with_suffix(combined.suffix + ".lock")
+    sources_path = _combined_sources_path(combined)
+    with lock_path.open("a+", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            known: set[str] = set()
+            if sources_path.is_file():
+                known = {
+                    ln.strip()
+                    for ln in sources_path.read_text(encoding="utf-8").splitlines()
+                    if ln.strip()
+                }
+            if source_name in known:
+                return
+            if not combined.exists() or combined.stat().st_size == 0:
+                df.write_csv(combined)
+            else:
+                with combined.open("rb+") as fh:
+                    fh.seek(0, 2)
+                    if fh.tell() > 0:
+                        fh.seek(-1, 2)
+                        if fh.read(1) != b"\n":
+                            fh.write(b"\n")
+                with combined.open("a", encoding="utf-8", newline="") as out:
+                    df.write_csv(out, include_header=False)
+            with sources_path.open("a", encoding="utf-8") as sf:
+                sf.write(source_name + "\n")
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
+
+
 
 
 def parse_success(stats: dict) -> bool:
@@ -188,9 +372,11 @@ def _parse_one_job(job: dict) -> dict:
             ocr_workers=int(job.get("ocr_workers") or 1),
             ocr_model=str(job.get("ocr_model") or "tiny"),
             retry_small=bool(job.get("retry_small", True)),
+            ocr_mode=str(job.get("ocr_mode") or "card"),
         )
         ok = parse_success(stats)
         if ok:
+            mark_scanned(Path(job["out_dir"]), pdf_path=item, stats=stats, ok=True)
             cleanup_after_parse(
                 item,
                 stem_paths.debug_dir,
@@ -199,6 +385,7 @@ def _parse_one_job(job: dict) -> dict:
             )
         return {
             "name": item.name,
+            "source": _combined_source_name(item),
             "csv": str(stem_paths.csv_dir / "voters.csv"),
             "ok": ok,
             "stats": stats,
@@ -207,6 +394,7 @@ def _parse_one_job(job: dict) -> dict:
     except Exception as exc:  # noqa: BLE001 — surface to parent process
         return {
             "name": item.name,
+            "source": _combined_source_name(item),
             "csv": str(stem_paths.csv_dir / "voters.csv"),
             "ok": False,
             "stats": stats,
@@ -223,6 +411,7 @@ def _format_parse_stats(stats: dict | None) -> str:
         f"refill={s.get('refillCalls')}/{s.get('refillSkips')} "
         f"ocr_workers={s.get('ocrWorkers')} "
         f"model={s.get('ocrModel')} "
+        f"mode={s.get('ocrMode')} "
         f"small_retry={s.get('smallRetryFixed')}/{s.get('smallRetryAttempted')}"
     )
 
@@ -264,8 +453,16 @@ def parse_cmd(
         "--retry-small/--no-retry-small",
         help="After the PDF, re-OCR invalid cards with small (skipped if primary is already small).",
     ),
+    ocr_mode: str = typer.Option(
+        "card",
+        "--ocr-mode",
+        help="OCR strategy: card (per-card, default) | row (10 row strips + x-assign + recover).",
+    ),
 ) -> None:
     """OCR electoral-roll PDFs into json/csv. Point at one file or the AC folder."""
+    ocr_mode = ocr_mode.lower().strip()
+    if ocr_mode not in ("card", "row"):
+        raise typer.BadParameter("--ocr-mode must be card or row")
     logger_ = setup_logging(log_dir / "parse.log", verbose=verbose)
     combined = out_dir / "csv" / "all_voters.csv"
     workers = max(1, workers)
@@ -280,20 +477,30 @@ def parse_cmd(
 
         jobs: list[dict] = []
         for item in pdfs:
-            stem_paths = RunPaths(
-                json_dir=out_dir / item.stem / "json",
-                csv_dir=out_dir / item.stem / "csv",
-                debug_dir=debug_dir / item.stem,
-                logs_dir=log_dir,
-            )
+            stem_paths = run_paths_for_pdf(item, out_dir, debug_dir, log_dir)
             skip = stem_paths.csv_dir / "voters.csv"
             if skip.exists() and skip.stat().st_size > 50:
                 logger_.info("skip existing %s", skip)
-                _append_combined(skip, item.name, combined)
+                _append_combined(skip, _combined_source_name(item), combined)
+                jpath = stem_paths.json_dir / "voters.json"
+                skip_stats: dict = {}
+                if jpath.is_file():
+                    try:
+                        payload = json.loads(jpath.read_text(encoding="utf-8"))
+                        skip_stats = {
+                            "validCount": payload.get("validCount"),
+                            "extractedTotal": payload.get("extractedTotal"),
+                            "expectedTotal": payload.get("expectedTotal"),
+                            "ocrMode": payload.get("ocrMode"),
+                        }
+                    except (OSError, json.JSONDecodeError):
+                        pass
+                mark_scanned(out_dir, pdf_path=item, stats=skip_stats, ok=True)
                 continue
             jobs.append(
                 {
                     "pdf": str(item.resolve()),
+                    "out_dir": str(out_dir.resolve()),
                     "json_dir": str(stem_paths.json_dir),
                     "csv_dir": str(stem_paths.csv_dir),
                     "debug_dir": str(stem_paths.debug_dir),
@@ -308,6 +515,7 @@ def parse_cmd(
                     "ocr_workers": ocr_workers,
                     "ocr_model": ocr_model,
                     "retry_small": retry_small,
+                    "ocr_mode": ocr_mode,
                 }
             )
 
@@ -324,7 +532,7 @@ def parse_cmd(
                     result["ok"],
                     _format_parse_stats(result.get("stats")),
                 )
-                _append_combined(Path(result["csv"]), result["name"], combined)
+                _append_combined(Path(result["csv"]), result.get("source") or result["name"], combined)
         else:
             ctx = mp.get_context("spawn")
             with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
@@ -340,19 +548,13 @@ def parse_cmd(
                         result["ok"],
                         _format_parse_stats(result.get("stats")),
                     )
-                    _append_combined(Path(result["csv"]), result["name"], combined)
+                    _append_combined(Path(result["csv"]), result.get("source") or result["name"], combined)
 
         console.print(f"[bold]Combined CSV[/bold]: {combined}")
         return
 
-    # Same nesting as folder mode: output/<stem>/… and debug/<stem>/cards/
-    stem = pdf.stem
-    paths = RunPaths(
-        json_dir=out_dir / stem / "json",
-        csv_dir=out_dir / stem / "csv",
-        debug_dir=debug_dir / stem,
-        logs_dir=log_dir,
-    )
+    # Nested: output/<District>/<NN_AC>/part_N/… and debug/<District>/<NN_AC>/part_N/
+    paths = run_paths_for_pdf(pdf, out_dir, debug_dir, log_dir)
     stats: dict = {}
     voters = run_pipeline(
         pdf,
@@ -367,10 +569,12 @@ def parse_cmd(
         ocr_workers=ocr_workers,
         ocr_model=ocr_model,
         retry_small=retry_small,
+        ocr_mode=ocr_mode,
     )
-    _append_combined(paths.csv_dir / "voters.csv", pdf.name, combined)
+    _append_combined(paths.csv_dir / "voters.csv", _combined_source_name(pdf), combined)
     logger_.info("done %s ok=%s %s", pdf.name, parse_success(stats), _format_parse_stats(stats))
     if parse_success(stats):
+        mark_scanned(out_dir, pdf_path=pdf.resolve(), stats=stats, ok=True)
         cleanup_after_parse(
             pdf.resolve(),
             paths.debug_dir,
@@ -385,9 +589,100 @@ def parse_cmd(
         )
 
 
+@app.command("smoke-compare")
+def smoke_compare_cmd(
+    pdf: Path = typer.Argument(..., exists=True, readable=True, help="One part PDF"),
+    pages: str = typer.Option(..., help="Pages to compare, e.g. 4,32"),
+    ocr_model: str = typer.Option("tiny"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+    log_dir: Path = typer.Option(Path("logs")),
+) -> None:
+    """Side-by-side: per-card OCR @2× vs page OCR → bbox assign (experiment)."""
+    setup_logging(log_dir / "smoke_compare.log", verbose=verbose)
+    page_nums = sorted({int(p.strip()) for p in pages.split(",") if p.strip()})
+    if not page_nums:
+        raise typer.BadParameter("need at least one page")
+
+    table = Table(title=f"smoke-compare {pdf.name}")
+    table.add_column("page")
+    table.add_column("path")
+    table.add_column("sec", justify="right")
+    table.add_column("ocr", justify="right")
+    table.add_column("scale", justify="right")
+    table.add_column("valid", justify="right")
+    table.add_column("miss epic/age/house")
+
+    for page_no in page_nums:
+        console.print(f"[bold]page {page_no}[/bold]")
+        card_s, page_s, row_s = compare_page(pdf, page_no, ocr_model=ocr_model)
+        for s in (card_s, page_s, row_s):
+            console.print(f"  {format_stats(s)}")
+            table.add_row(
+                str(page_no),
+                s.name,
+                f"{s.seconds:.2f}",
+                str(s.ocr_calls),
+                f"{s.scale:g}",
+                f"{s.valid}/{s.extracted}",
+                f"{s.missing_epic}/{s.missing_age}/{s.missing_house}",
+            )
+        if page_s.seconds > 0:
+            console.print(
+                f"  vs card: page={card_s.seconds / page_s.seconds:.2f}x  "
+                f"row={card_s.seconds / row_s.seconds:.2f}x  "
+                f"valid card/page/row={card_s.valid}/{page_s.valid}/{row_s.valid}"
+            )
+    console.print(table)
+
+
+@app.command("smoke-page")
+def smoke_page_cmd(
+    pdf: Path = typer.Argument(..., exists=True, readable=True, help="One part PDF"),
+    ocr_model: str = typer.Option("tiny"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+    log_dir: Path = typer.Option(Path("logs")),
+) -> None:
+    """Full-PDF experiment: page OCR → assign on every voter page (no card×30)."""
+    setup_logging(log_dir / "smoke_page.log", verbose=verbose)
+    t0 = time.perf_counter()
+    results = scan_pdf_page_assign(pdf, ocr_model=ocr_model)
+    wall = time.perf_counter() - t0
+    valid = sum(s.valid for s in results)
+    extracted = sum(s.extracted for s in results)
+    miss_e = sum(s.missing_epic for s in results)
+    miss_a = sum(s.missing_age for s in results)
+    miss_h = sum(s.missing_house for s in results)
+    ocr_sum = sum(s.seconds for s in results)
+    console.print(
+        f"[bold]{pdf.name}[/bold] voter_pages={len(results)} wall={wall:.1f}s "
+        f"(sum page OCR {ocr_sum:.1f}s) valid={valid}/{extracted} "
+        f"miss epic/age/house={miss_e}/{miss_a}/{miss_h}"
+    )
+    table = Table(title=f"smoke-page {pdf.name}")
+    table.add_column("page", justify="right")
+    table.add_column("sec", justify="right")
+    table.add_column("scale", justify="right")
+    table.add_column("valid", justify="right")
+    table.add_column("miss e/a/h")
+    for s in results:
+        table.add_row(
+            str(s.page),
+            f"{s.seconds:.2f}",
+            f"{s.scale:g}",
+            f"{s.valid}/{s.extracted}",
+            f"{s.missing_epic}/{s.missing_age}/{s.missing_house}",
+        )
+    console.print(table)
+
+
 @app.command("retry-invalid")
 def retry_invalid_cmd(
-    pdf: Path = typer.Argument(..., exists=True, readable=True, help="PDF file or folder of part_*.pdf"),
+    pdf: Path = typer.Argument(
+        ...,
+        exists=True,
+        readable=True,
+        help="PDF file/folder, or AC folder (downloads or output) when PDFs are gone",
+    ),
     out_dir: Path = typer.Option(Path("output"), help="Where parse wrote json/csv"),
     debug_dir: Path = typer.Option(Path("debug"), help="Crops / page rasters"),
     log_dir: Path = typer.Option(Path("logs"), help="Run logs"),
@@ -399,22 +694,54 @@ def retry_invalid_cmd(
     keep_pdf: bool = typer.Option(True, "--keep-pdf/--delete-pdf", help="Keep PDFs after retry"),
     ocr_workers: int = typer.Option(1),
     ocr_model: str = typer.Option("tiny"),
+    ocr_mode: str = typer.Option("card", help="card | row (PDF retry and debug-PNG fallback)"),
     retry_small: bool = typer.Option(True, "--retry-small/--no-retry-small"),
 ) -> None:
-    """Re-OCR only pages that still have invalid voters; merge into existing voters.json."""
+    """Re-OCR only pages that still have invalid voters; merge into existing voters.json.
+
+    If the PDF path has no PDFs, falls back to debug page PNGs under --debug-dir
+    (same as retry-invalid-rasters), using matching parts under --out-dir.
+    """
     logger_ = setup_logging(log_dir / "retry_invalid.log", verbose=verbose)
     combined = out_dir / "csv" / "all_voters.csv"
-    pdfs = _sort_pdfs(list(pdf.glob("*.pdf"))) if pdf.is_dir() else [pdf]
+    pdfs = _sort_pdfs(list(pdf.glob("*.pdf"))) if pdf.is_dir() else ([pdf] if pdf.suffix.lower() == ".pdf" else [])
     if not pdfs:
-        raise typer.BadParameter(f"No PDFs in {pdf}")
+        part_dirs = _resolve_raster_part_dirs(pdf, out_dir)
+        if not part_dirs:
+            raise typer.BadParameter(
+                f"No PDFs in {pdf} and no part_*/json/voters.json found under "
+                f"{out_dir} for that AC (need debug page PNGs for raster fallback)"
+            )
+        logger_.info(
+            "retry-invalid: no PDFs in %s — falling back to debug page PNGs (%s parts)",
+            pdf,
+            len(part_dirs),
+        )
+        console.print(
+            f"[yellow]No PDFs in {pdf}[/yellow] — falling back to debug page PNGs "
+            f"({len(part_dirs)} parts)"
+        )
+        parts_touched, total_delta = _run_raster_retry_parts(
+            part_dirs,
+            out_dir=out_dir,
+            debug_dir=debug_dir,
+            log_dir=log_dir,
+            combined=combined,
+            logger_=logger_,
+            ocr_workers=ocr_workers,
+            ocr_model=ocr_model,
+            ocr_mode=ocr_mode,
+            retry_small=retry_small,
+            skip_age_gender_clip=False,
+        )
+        console.print(
+            f"[bold]Done[/bold] (raster fallback) parts_touched={parts_touched} "
+            f"valid_delta={total_delta:+d} combined={combined}"
+        )
+        return
 
     for item in pdfs:
-        stem_paths = RunPaths(
-            json_dir=out_dir / item.stem / "json",
-            csv_dir=out_dir / item.stem / "csv",
-            debug_dir=debug_dir / item.stem,
-            logs_dir=log_dir,
-        )
+        stem_paths = run_paths_for_pdf(item, out_dir, debug_dir, log_dir)
         json_path = stem_paths.json_dir / "voters.json"
         if not json_path.is_file():
             logger_.warning("skip %s — no %s", item.name, json_path)
@@ -433,6 +760,7 @@ def retry_invalid_cmd(
                 ocr_workers=ocr_workers,
                 ocr_model=ocr_model,
                 retry_small=retry_small,
+                ocr_mode=ocr_mode,
             )
         except Exception as exc:
             logger_.exception("retry-invalid failed %s: %s", item.name, exc)
@@ -454,8 +782,9 @@ def retry_invalid_cmd(
             f"valid={stats.get('validCount')}/{stats.get('extractedTotal')} "
             f"expected={stats.get('expectedTotal')}"
         )
-        _append_combined(stem_paths.csv_dir / "voters.csv", item.name, combined)
+        _append_combined(stem_paths.csv_dir / "voters.csv", _combined_source_name(item), combined)
         if parse_success(stats):
+            mark_scanned(out_dir, pdf_path=item.resolve(), stats=stats, ok=True)
             cleanup_after_parse(
                 item.resolve(),
                 stem_paths.debug_dir,
@@ -463,6 +792,78 @@ def retry_invalid_cmd(
                 voters=voters,
             )
     console.print(f"[bold]Combined CSV[/bold]: {combined}")
+
+
+@app.command("retry-invalid-rasters")
+def retry_invalid_rasters_cmd(
+    target: Path = typer.Argument(
+        ...,
+        exists=True,
+        readable=True,
+        help="AC folder under output/ (e.g. output/Rangareddy/51_Rajendranagar) or one part_* dir",
+    ),
+    out_dir: Path = typer.Option(Path("output"), help="Parse output root"),
+    debug_dir: Path = typer.Option(Path("debug"), help="Debug root (page PNGs)"),
+    log_dir: Path = typer.Option(Path("logs"), help="Run logs"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+    ocr_workers: int = typer.Option(1),
+    ocr_model: str = typer.Option("tiny"),
+    ocr_mode: str = typer.Option("card", help="card | row"),
+    retry_small: bool = typer.Option(True, "--retry-small/--no-retry-small"),
+    skip_age_gender_clip: bool = typer.Option(
+        True,
+        "--skip-age-gender-clip/--include-age-gender-clip",
+        help="Skip voters whose only errors are exactly missing_age+missing_gender (6-line wrap).",
+    ),
+) -> None:
+    """Re-OCR non-clip invalid pages from debug page PNGs (no PDF required)."""
+    logger_ = setup_logging(log_dir / "retry_invalid_rasters.log", verbose=verbose)
+    combined = out_dir / "csv" / "all_voters.csv"
+    out_dir = out_dir.expanduser().resolve()
+    debug_dir = debug_dir.expanduser().resolve()
+    target = target.expanduser().resolve()
+
+    part_dirs = _resolve_raster_part_dirs(target, out_dir)
+    if not part_dirs:
+        raise typer.BadParameter(f"No part_*/json/voters.json under {target}")
+
+    logger_.info(
+        "raster-retry target=%s parts=%s skip_clip=%s mode=%s model=%s",
+        target,
+        len(part_dirs),
+        skip_age_gender_clip,
+        ocr_mode,
+        ocr_model,
+    )
+    parts_touched, total_delta = _run_raster_retry_parts(
+        part_dirs,
+        out_dir=out_dir,
+        debug_dir=debug_dir,
+        log_dir=log_dir,
+        combined=combined,
+        logger_=logger_,
+        ocr_workers=ocr_workers,
+        ocr_model=ocr_model,
+        ocr_mode=ocr_mode,
+        retry_small=retry_small,
+        skip_age_gender_clip=skip_age_gender_clip,
+    )
+    console.print(
+        f"[bold]Done[/bold] parts_touched={parts_touched} valid_delta={total_delta:+d} "
+        f"combined={combined}"
+    )
+
+
+@app.command("coverage-backfill")
+def coverage_backfill_cmd(
+    out_dir: Path = typer.Option(Path("output"), help="Parse output root (coverage.json lives here)"),
+) -> None:
+    """Rebuild coverage.json from existing voters.json source paths."""
+    stats = backfill_from_output(out_dir)
+    console.print(
+        f"coverage ledger {out_dir / 'coverage.json'}: "
+        f"added={stats['added']} updated={stats['updated']} skipped={stats['skipped']}"
+    )
 
 
 @app.command("refill")
@@ -474,7 +875,7 @@ def refill_cmd(
     if json_path is not None:
         targets = [json_path]
     else:
-        nested = sorted(out_dir.glob("*/json/voters.json"))
+        nested = sorted(out_dir.glob("**/part_*/json/voters.json"))
         root_json = out_dir / "json" / "voters.json"
         targets = nested if nested else ([root_json] if root_json.exists() else [])
     if not targets:
@@ -534,6 +935,11 @@ def ui_cmd(
     out_dir: Path = typer.Option(Path("output"), help="Where parse wrote csv/"),
     host: str = typer.Option("127.0.0.1"),
     port: int = typer.Option(8765),
+    backfill: bool = typer.Option(
+        True,
+        "--backfill/--no-backfill",
+        help="Refresh coverage.json from voters.json sources before serving",
+    ),
 ) -> None:
     """Open a local search page for parsed voters."""
     from ui.server import serve
@@ -541,6 +947,12 @@ def ui_cmd(
     csv = out_dir / "csv" / "all_voters.csv"
     if not csv.exists():
         raise typer.BadParameter(f"No combined CSV at {csv}. Run parse first.")
+    if backfill:
+        stats = backfill_from_output(out_dir)
+        console.print(
+            f"coverage backfill: added={stats['added']} updated={stats['updated']} "
+            f"skipped={stats['skipped']}"
+        )
     serve(out_dir.resolve(), host=host, port=port)
 
 
