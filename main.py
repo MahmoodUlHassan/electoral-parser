@@ -19,6 +19,15 @@ from parser.logutil import setup_logging
 from parser.coverage import backfill_from_output, mark_scanned, roll_rel_path
 from parser.pipeline import RunPaths, refill_saved_json, retry_invalid_pages, run_pipeline
 from parser.raster_retry import retry_invalid_from_rasters
+from exporters.voters_db import (
+    count_voters,
+    db_path_for_combined,
+    default_db_path,
+    ensure_db_from_csv,
+    import_csv,
+    search as db_search,
+    upsert_part_from_dataframe,
+)
 from parser.search import SEARCH_COLUMNS, load_voters, search_voters
 from parser.smoke_compare import compare_page, format_stats, scan_pdf_page_assign
 
@@ -184,11 +193,14 @@ def _combined_source_name(pdf: Path) -> str:
 
 
 def _append_combined(csv_path: Path, source_name: str, combined: Path) -> None:
-    """Append one part's voters.csv into the combined ledger.
+    """Append one part's voters.csv into the combined ledger + SQLite search DB.
 
     Uses an exclusive lock + row append (not full rewrite) so parallel parses and
     large ledgers cannot corrupt all_voters.csv with partial overwrites/null bytes.
-    A sidecar `.sources` list prevents duplicate appends on parse resume/skip.
+    A sidecar `.sources` list prevents duplicate CSV appends on parse resume/skip.
+
+    SQLite (``csv/voters.db``) always replaces rows for ``source_name`` so
+    retries/refills refresh UI search even when CSV append is skipped.
     """
     if not csv_path.exists():
         return
@@ -200,6 +212,7 @@ def _append_combined(csv_path: Path, source_name: str, combined: Path) -> None:
     combined.parent.mkdir(parents=True, exist_ok=True)
     lock_path = combined.with_suffix(combined.suffix + ".lock")
     sources_path = _combined_sources_path(combined)
+    db_path = db_path_for_combined(combined)
     with lock_path.open("a+", encoding="utf-8") as lock_fh:
         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
         try:
@@ -210,21 +223,22 @@ def _append_combined(csv_path: Path, source_name: str, combined: Path) -> None:
                     for ln in sources_path.read_text(encoding="utf-8").splitlines()
                     if ln.strip()
                 }
-            if source_name in known:
-                return
-            if not combined.exists() or combined.stat().st_size == 0:
-                df.write_csv(combined)
-            else:
-                with combined.open("rb+") as fh:
-                    fh.seek(0, 2)
-                    if fh.tell() > 0:
-                        fh.seek(-1, 2)
-                        if fh.read(1) != b"\n":
-                            fh.write(b"\n")
-                with combined.open("a", encoding="utf-8", newline="") as out:
-                    df.write_csv(out, include_header=False)
-            with sources_path.open("a", encoding="utf-8") as sf:
-                sf.write(source_name + "\n")
+            if source_name not in known:
+                if not combined.exists() or combined.stat().st_size == 0:
+                    df.write_csv(combined)
+                else:
+                    with combined.open("rb+") as fh:
+                        fh.seek(0, 2)
+                        if fh.tell() > 0:
+                            fh.seek(-1, 2)
+                            if fh.read(1) != b"\n":
+                                fh.write(b"\n")
+                    with combined.open("a", encoding="utf-8", newline="") as out:
+                        df.write_csv(out, include_header=False)
+                with sources_path.open("a", encoding="utf-8") as sf:
+                    sf.write(source_name + "\n")
+            # Always refresh search DB for this source (retry/refill-safe).
+            upsert_part_from_dataframe(db_path, source_name, df)
         finally:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
@@ -901,32 +915,73 @@ def refill_cmd(
     console.print(f"[bold]Combined CSV[/bold]: {combined}")
 
 
+@app.command("db-import")
+def db_import_cmd(
+    out_dir: Path = typer.Option(Path("output"), help="Where parse wrote csv/"),
+    csv: Path | None = typer.Option(
+        None, help="CSV to import; default is out_dir/csv/all_voters.csv"
+    ),
+    db: Path | None = typer.Option(
+        None, help="SQLite path; default is out_dir/csv/voters.db"
+    ),
+) -> None:
+    """One-shot import of all_voters.csv into voters.db for UI search."""
+    csv_path = Path(csv) if csv else out_dir / "csv" / "all_voters.csv"
+    db_path = Path(db) if db else default_db_path(out_dir)
+    if not csv_path.is_file():
+        raise typer.BadParameter(f"No CSV at {csv_path}")
+    console.print(f"Importing {csv_path} → {db_path} …")
+    n = import_csv(csv_path, db_path, replace=True)
+    console.print(f"[bold]Done[/bold] rows={n} db={db_path}")
+
+
 @app.command("search")
 def search_cmd(
     name: str = typer.Argument(..., help="Substring match on name or relativeName"),
     out_dir: Path = typer.Option(Path("output"), help="Where parse wrote csv/"),
-    csv: Path | None = typer.Option(None, help="Explicit voters.csv; default is output/csv/all_voters.csv plus globs"),
+    csv: Path | None = typer.Option(
+        None,
+        help="Force CSV search (loads full file). Default: query voters.db",
+    ),
 ) -> None:
-    """Find voters by name after parse. Case-insensitive substring."""
-    df = load_voters(out_dir, csv)
-    if df.is_empty():
-        raise typer.BadParameter("CSV files are empty.")
+    """Find voters by name after parse. Case-insensitive substring (SQLite)."""
     needle = name.strip()
     if needle == "":
         raise typer.BadParameter("Empty name")
 
-    hits = search_voters(df, needle)
+    if csv is not None:
+        df = load_voters(out_dir, csv)
+        if df.is_empty():
+            raise typer.BadParameter("CSV files are empty.")
+        hits_df = search_voters(df, needle)
+        if hits_df.is_empty():
+            console.print(f"No matches for [bold]{name}[/bold]")
+            raise typer.Exit(code=1)
+        cols = [c for c in SEARCH_COLUMNS if c in hits_df.columns]
+        table = Table(title=f"{hits_df.height} match(es) for “{name}”")
+        for c in cols:
+            table.add_column(c)
+        for row in hits_df.select(cols).iter_rows():
+            table.add_row(*["" if v is None else str(v) for v in row])
+        console.print(table)
+        return
 
-    if hits.is_empty():
+    db_path = default_db_path(out_dir)
+    ensure_db_from_csv(out_dir)
+    if count_voters(db_path) == 0:
+        raise typer.BadParameter(
+            f"No voters in {db_path}. Run parse or: python main.py db-import"
+        )
+    rows = db_search(db_path, needle, limit=200)
+    if not rows:
         console.print(f"No matches for [bold]{name}[/bold]")
         raise typer.Exit(code=1)
 
-    cols = [c for c in SEARCH_COLUMNS if c in hits.columns]
-    table = Table(title=f"{hits.height} match(es) for “{name}”")
-    for c in cols:
+    table = Table(title=f"{len(rows)} match(es) for “{name}” (showing up to 200)")
+    for c in SEARCH_COLUMNS:
         table.add_column(c)
-    for row in hits.select(cols).iter_rows():
-        table.add_row(*["" if v is None else str(v) for v in row])
+    for row in rows:
+        table.add_row(*["" if row.get(c) is None else str(row.get(c)) for c in SEARCH_COLUMNS])
     console.print(table)
 
 
@@ -941,18 +996,25 @@ def ui_cmd(
         help="Refresh coverage.json from voters.json sources before serving",
     ),
 ) -> None:
-    """Open a local search page for parsed voters."""
+    """Open a local search page for parsed voters (reads csv/voters.db)."""
     from ui.server import serve
 
     csv = out_dir / "csv" / "all_voters.csv"
-    if not csv.exists():
-        raise typer.BadParameter(f"No combined CSV at {csv}. Run parse first.")
+    db_path = default_db_path(out_dir)
+    if not csv.exists() and count_voters(db_path) == 0:
+        raise typer.BadParameter(
+            f"No combined CSV at {csv} and no voters.db. Run parse first."
+        )
     if backfill:
         stats = backfill_from_output(out_dir)
         console.print(
             f"coverage backfill: added={stats['added']} updated={stats['updated']} "
             f"skipped={stats['skipped']}"
         )
+    if csv.exists():
+        console.print(f"Ensuring search DB at {db_path} (imports CSV if empty)…")
+        ensure_db_from_csv(out_dir)
+    console.print(f"voters.db rows={count_voters(db_path)}")
     serve(out_dir.resolve(), host=host, port=port)
 
 

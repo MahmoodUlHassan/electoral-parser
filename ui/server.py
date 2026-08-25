@@ -5,8 +5,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from exporters.voters_db import default_db_path
 from parser.coverage import ac_parts_payload, build_coverage_tree, resolve_part_pdf
-from parser.search import filter_by_coverage, load_voters, rows_as_dicts, search_voters
+from parser.search import query_voters, voters_total
 
 UI_DIR = Path(__file__).resolve().parent
 INDEX = UI_DIR / "index.html"
@@ -37,10 +38,14 @@ def make_handler(out_dir: Path) -> type[BaseHTTPRequestHandler]:
                 self._send(200, INDEX.read_bytes(), "text/html; charset=utf-8")
                 return
             if path == "/api/stats":
-                df = load_voters(out_dir)
+                total = voters_total(out_dir)
                 self._json(
                     200,
-                    {"total": df.height, "csv": str(out_dir / "csv" / "all_voters.csv")},
+                    {
+                        "total": total,
+                        "csv": str(out_dir / "csv" / "all_voters.csv"),
+                        "db": str(default_db_path(out_dir)),
+                    },
                 )
                 return
             if path == "/api/search":
@@ -53,22 +58,20 @@ def make_handler(out_dir: Path) -> type[BaseHTTPRequestHandler]:
                 part_no = int(part_raw) if part_raw.isdigit() else None
                 has_filter = bool(district or ac or asmbly_no is not None or part_no is not None)
 
-                df = load_voters(out_dir)
-                hits = df
-                if has_filter:
-                    hits = filter_by_coverage(
-                        hits,
+                if not q.strip() and not has_filter:
+                    count, voters = 0, []
+                else:
+                    limit = 500 if part_no is not None else 200
+                    count, voters = query_voters(
+                        out_dir,
+                        q,
                         district=district,
                         ac=ac,
                         asmbly_no=asmbly_no,
                         part_no=part_no,
+                        limit=limit,
                     )
-                if q.strip():
-                    hits = search_voters(hits, q)
-                elif not has_filter:
-                    hits = df.head(0)
 
-                limit = 500 if part_no is not None else 200
                 self._json(
                     200,
                     {
@@ -79,8 +82,8 @@ def make_handler(out_dir: Path) -> type[BaseHTTPRequestHandler]:
                             "asmblyNo": asmbly_no,
                             "partNo": part_no,
                         },
-                        "count": hits.height,
-                        "voters": rows_as_dicts(hits.head(limit)),
+                        "count": count,
+                        "voters": voters,
                     },
                 )
                 return
@@ -139,6 +142,6 @@ def make_handler(out_dir: Path) -> type[BaseHTTPRequestHandler]:
 def serve(out_dir: Path, host: str = "127.0.0.1", port: int = 8765) -> None:
     httpd = ThreadingHTTPServer((host, port), make_handler(out_dir))
     print(f"Voter search: http://{host}:{port}", flush=True)
-    print(f"Reading {out_dir / 'csv' / 'all_voters.csv'}  (Ctrl+C to stop)", flush=True)
+    print(f"Reading {default_db_path(out_dir)}  (Ctrl+C to stop)", flush=True)
     print(f"Coverage: {out_dir / 'coverage.json'}", flush=True)
     httpd.serve_forever()

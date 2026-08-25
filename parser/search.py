@@ -6,6 +6,13 @@ from pathlib import Path
 import polars as pl
 
 from exporters.writers import CSV_COLUMNS
+from exporters.voters_db import (
+    count_voters,
+    default_db_path,
+    ensure_db_from_csv,
+    search as db_search,
+    search_count as db_search_count,
+)
 
 SEARCH_COLUMNS = CSV_COLUMNS + ["sourcePdf"]
 TEXT_FIELDS = ("name", "relativeName", "epic", "houseNo", "section", "sourcePdf")
@@ -14,6 +21,7 @@ _AC_FOLDER_RE = re.compile(r"^(\d+)_(.+)$")
 
 
 def load_voters(out_dir: Path, csv: Path | None = None) -> pl.DataFrame:
+    """Load voters from CSV (full file). Prefer query_voters / voters.db for UI."""
     files: list[Path] = []
     if csv is not None:
         files = [csv]
@@ -120,3 +128,42 @@ def rows_as_dicts(df: pl.DataFrame) -> list[dict]:
         return []
     keep = [c for c in SEARCH_COLUMNS if c in df.columns]
     return df.select(keep).to_dicts()
+
+
+def query_voters(
+    out_dir: Path,
+    query: str = "",
+    *,
+    district: str | None = None,
+    ac: str | None = None,
+    asmbly_no: int | None = None,
+    part_no: int | None = None,
+    limit: int = 200,
+) -> tuple[int, list[dict]]:
+    """Search via SQLite (``out_dir/csv/voters.db``). Returns (total_count, rows)."""
+    db_path = default_db_path(out_dir)
+    ensure_db_from_csv(out_dir)
+    total = db_search_count(
+        db_path,
+        query,
+        district=district,
+        ac=ac,
+        asmbly_no=asmbly_no,
+        part_no=part_no,
+    )
+    rows = db_search(
+        db_path,
+        query,
+        district=district,
+        ac=ac,
+        asmbly_no=asmbly_no,
+        part_no=part_no,
+        limit=limit,
+    )
+    return total, rows
+
+
+def voters_total(out_dir: Path) -> int:
+    """Row count from voters.db (imports from CSV once if DB empty)."""
+    ensure_db_from_csv(out_dir)
+    return count_voters(default_db_path(out_dir))
