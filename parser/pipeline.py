@@ -33,6 +33,14 @@ from extractors.voter import (
     parse_voter_card,
 )
 from ocr.engine import DEFAULT_OCR_MODEL, OcrEnginePool, PaddleOcrEngine
+from ocr.assign import scale_token_to_page
+from ocr.row_strip import (
+    assign_tokens_by_x,
+    group_cards_into_rows,
+    prepare_row_strip,
+    row_ocr_scale,
+    tokens_to_card_local_from_strip,
+)
 from ocr.types import OcrEngine, OcrResult
 from parser.config import DEFAULT_LAYOUT, LayoutProfile, NATIVE_EXTRACT, RelativeBox
 from parser.models import OcrToken, PageMeta, PageType, VoterRecord
@@ -86,6 +94,136 @@ def _upscale(image: np.ndarray, factor: float = 2.0) -> np.ndarray:
     if factor == 1.0:
         return image
     return cv2.resize(image, None, fx=factor, fy=factor, interpolation=cv2.INTER_CUBIC)
+
+
+def _recover_invalid_card_row(
+    image: np.ndarray,
+    card,
+    page_no: int,
+    meta: PageMeta,
+    ocr: OcrEngine,
+    layout: LayoutProfile,
+    *,
+    crop_path: str | None,
+    small: OcrEngine | None,
+    profiler: PhaseProfiler | None = None,
+) -> tuple[VoterRecord, int, int]:
+    """Card re-OCR @2× → band refill → optional small. Returns (rec, refill_delta, ocr_extra)."""
+    refill = 0
+    ocr_extra = 0
+    with _maybe_track(profiler, "OCR card recover", count=1):
+        ocr_image = _upscale(crop_card_for_ocr(image, card, layout), 2.0)
+        result = ocr.recognize(ocr_image)
+        ocr_extra += 1
+    rec = parse_voter_card(
+        result.tokens,
+        page=page_no,
+        meta=meta,
+        crop_width=ocr_image.shape[1],
+        crop_height=ocr_image.shape[0],
+        crop_path=crop_path,
+        mean_confidence=result.mean_confidence,
+    )
+    rec = merge_card_fields(rec, parse_labeled_lines(rec.raw_ocr))
+    if needs_band_refill(rec):
+        full_2x = _upscale(crop_card(image, card), 2.0)
+        rec = refill_missing_fields(rec, ocr, full_2x, layout, profiler=profiler)
+        if rec.age is None or rec.gender is None:
+            rec = refill_age_from_expanded_crop(
+                rec, ocr, image, card.box, layout, profiler=profiler
+            )
+        refill = 1
+    rec = validate_voter(rec, layout)
+    if rec.valid or small is None:
+        return rec, refill, ocr_extra
+
+    with _maybe_track(profiler, "OCR small recover", count=1):
+        small_img = _upscale(crop_card_padded(image, card), 2.0)
+        result = small.recognize(small_img)
+        ocr_extra += 1
+    updated = parse_voter_card(
+        result.tokens,
+        page=page_no,
+        meta=meta,
+        crop_width=small_img.shape[1],
+        crop_height=small_img.shape[0],
+        crop_path=crop_path,
+        mean_confidence=result.mean_confidence,
+    )
+    updated = merge_card_fields(updated, parse_labeled_lines(updated.raw_ocr))
+    if needs_band_refill(updated):
+        updated = refill_missing_fields(
+            updated, small, _upscale(crop_card(image, card), 2.0), layout, profiler=profiler
+        )
+        refill += 1
+    updated = validate_voter(updated, layout)
+    return updated, refill, ocr_extra
+
+
+def _process_voter_page_row(
+    image: np.ndarray,
+    page_no: int,
+    page_meta: PageMeta,
+    cards: list,
+    ocr: OcrEngine,
+    layout: LayoutProfile,
+    paths: RunPaths,
+    *,
+    small: OcrEngine | None,
+    profiler: PhaseProfiler | None = None,
+) -> tuple[list[VoterRecord], int, int]:
+    """Row-strip OCR → x-assign → parse; recover invalids with card/bands/small."""
+    refill_calls = 0
+    refill_skips = 0
+    rows = group_cards_into_rows(cards, layout)
+    by_index: dict[int, VoterRecord] = {}
+
+    for row_cards in rows:
+        strip, union = prepare_row_strip(image, row_cards, layout)
+        scale = row_ocr_scale(row_cards)
+        with _maybe_track(profiler, "OCR row strip", count=1):
+            result = ocr.recognize(_upscale(strip, scale))
+        tokens = [scale_token_to_page(t, scale) for t in result.tokens]
+        buckets = assign_tokens_by_x(tokens, row_cards, union)
+        for card in row_cards:
+            crop_name = f"page{page_no}_card{card.index + 1}.png"
+            crop_path = paths.debug_dir / "cards" / crop_name
+            save_card_crop(image, card, crop_path)
+            local = tokens_to_card_local_from_strip(
+                buckets.get(card.index, []), card, union
+            )
+            with _maybe_track(profiler, "Parse card fields", count=1):
+                rec = parse_voter_card(
+                    local,
+                    page=page_no,
+                    meta=page_meta,
+                    crop_width=card.box.w,
+                    crop_height=card.box.h,
+                    crop_path=str(crop_path),
+                    mean_confidence=result.mean_confidence,
+                )
+                rec = merge_card_fields(rec, parse_labeled_lines(rec.raw_ocr))
+                rec = validate_voter(rec, layout)
+            if rec.epic is None and rec.name is None:
+                continue
+            if not rec.valid:
+                rec, r_delta, _ = _recover_invalid_card_row(
+                    image,
+                    card,
+                    page_no,
+                    page_meta,
+                    ocr,
+                    layout,
+                    crop_path=str(crop_path),
+                    small=small,
+                    profiler=profiler,
+                )
+                refill_calls += r_delta
+            else:
+                refill_skips += 1
+            by_index[card.index] = rec
+
+    return [by_index[i] for i in sorted(by_index)], refill_calls, refill_skips
 
 
 def _ocr_band(
@@ -486,6 +624,7 @@ def run_pipeline(
     ocr_workers: int = 1,
     ocr_model: str = DEFAULT_OCR_MODEL,
     retry_small: bool = True,
+    ocr_mode: str = "card",
     merge_keep: list[VoterRecord] | None = None,
     seed_extra: dict | None = None,
 ) -> list[VoterRecord]:
@@ -494,6 +633,9 @@ def run_pipeline(
     profiler = PhaseProfiler() if profile else None
     ocr_workers = max(1, ocr_workers)
     ocr_model = (ocr_model or DEFAULT_OCR_MODEL).lower()
+    ocr_mode = (ocr_mode or "card").lower()
+    if ocr_mode not in ("card", "row"):
+        raise ValueError(f"ocr_mode must be 'card' or 'row', got {ocr_mode!r}")
 
     logger.info("Opening %s", pdf_path)
     with _maybe_track(profiler, "PDF open"):
@@ -518,6 +660,12 @@ def run_pipeline(
             )
             logger.info("OCR engine pool size=%s model=%s", len(ocr), ocr_model)
 
+    small_for_row: OcrEngine | None = None
+    if ocr_mode == "row" and retry_small and ocr_model != "small":
+        small_for_row = PaddleOcrEngine(lang="en", model="small", profiler=profiler)
+        small_for_row._ensure()  # type: ignore[attr-defined]
+        logger.info("row mode: small recover engine ready")
+
     voters: list[VoterRecord] = []
     global_meta = PageMeta()
     page_types: dict[int, str] = {}
@@ -526,6 +674,7 @@ def run_pipeline(
     header_ocr_done = False
     small_retry_attempted = 0
     small_retry_fixed = 0
+    logger.info("ocr_mode=%s", ocr_mode)
 
     with Progress(
         SpinnerColumn(),
@@ -600,6 +749,24 @@ def run_pipeline(
             page_meta.section = page_meta.section or global_meta.section
             page_meta.constituency_no = page_meta.constituency_no or global_meta.constituency_no
             page_meta.section_no = page_meta.section_no or global_meta.section_no
+
+            if ocr_mode == "row":
+                page_voters, r_calls, r_skips = _process_voter_page_row(
+                    image,
+                    page_no,
+                    page_meta,
+                    occupied,
+                    ocr,
+                    layout,
+                    paths,
+                    small=small_for_row,
+                    profiler=profiler,
+                )
+                refill_calls += r_calls
+                refill_skips += r_skips
+                voters.extend(page_voters)
+                progress.advance(task)
+                continue
 
             prepared: list[tuple] = []
             # Sparse / last voter pages: photo wipe often destroys EPIC; use full card.
@@ -692,6 +859,7 @@ def run_pipeline(
         "refillSkips": refill_skips,
         "ocrWorkers": ocr_workers,
         "ocrModel": ocr_model,
+        "ocrMode": ocr_mode,
         "smallRetryAttempted": small_retry_attempted,
         "smallRetryFixed": small_retry_fixed,
     }
@@ -710,13 +878,14 @@ def run_pipeline(
             stats["profile"] = profiler.to_dict()
     logger.info(
         "extracted %s voters (%s valid) expected=%s refill=%s skip=%s "
-        "model=%s small_retry=%s/%s",
+        "model=%s mode=%s small_retry=%s/%s",
         len(voters),
         extra["validCount"],
         global_meta.expected_total,
         refill_calls,
         refill_skips,
         ocr_model,
+        ocr_mode,
         small_retry_fixed,
         small_retry_attempted,
     )
@@ -734,6 +903,7 @@ def run_pipeline(
                 "refillSkips": refill_skips,
                 "ocrWorkers": ocr_workers,
                 "ocrModel": ocr_model,
+                "ocrMode": ocr_mode,
                 "smallRetryAttempted": small_retry_attempted,
                 "smallRetryFixed": small_retry_fixed,
             },
@@ -757,6 +927,7 @@ def retry_invalid_pages(
     ocr_workers: int = 1,
     ocr_model: str = DEFAULT_OCR_MODEL,
     retry_small: bool = True,
+    ocr_mode: str = "card",
 ) -> list[VoterRecord]:
     """Re-OCR only pages that still have invalid voters; merge back into voters.json."""
     paths.ensure()
@@ -802,6 +973,7 @@ def retry_invalid_pages(
         ocr_workers=ocr_workers,
         ocr_model=ocr_model,
         retry_small=retry_small,
+        ocr_mode=ocr_mode,
         merge_keep=existing,
         seed_extra=payload,
     )
